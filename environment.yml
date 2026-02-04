@@ -1,0 +1,12 @@
+name: DMD
+channels:
+  - pytorch
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pytorch=2.2
+  - pip
+  - pip:
+      - torchvision
+      - jupyter
