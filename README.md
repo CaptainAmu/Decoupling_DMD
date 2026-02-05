@@ -61,7 +61,7 @@ Flow-matching velocity model v_θ(x_t, t, c) with simple/pair data sources, trai
 ## Usage sketch
 
 ```python
-from DMD import simple_sample, pair_sample, VelocityMLP, train_flow_matching, ode_backward, clean_pred, score_s
+from DMD import simple_sample, pair_sample, VelocityMLP, train_flow_matching, ode_backward, CleanPredModel, ScoreModel
 
 # Data
 C, N = 5, 32
@@ -77,6 +77,9 @@ c_gen = 2
 x0_gen = ode_backward(model, T=50, K=64, c=c_gen, guidance=3.0)
 
 # Score and clean prediction (fixed pretrained v)
-x_clean = clean_pred(model, x_t, t, c)
-s = score_s(model, x_t, t, c, g=1.0)
+clean_model = CleanPredModel(model)
+score_model = ScoreModel(model)
+
+x_clean = clean_model(x_t, t, c)
+s = score_model(x_t, t, c, g=1.0)
 ```
