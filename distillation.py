@@ -12,7 +12,7 @@ import torch.nn as nn
 from score import ScoreModel
 
 
-def train_generator_regression(
+def initialize_generator_regression(
     G,
     clean_model,
     num_steps=1000,
@@ -146,23 +146,28 @@ def train_generator_ikl(
     a=1.0,
     g=1.0,
     lr=1e-4,
+    clean_model = None,
     reweight=False,
+    reg_weight=0.0,
     device=None,
     verbose=True,
 ):
     """
-    Update G_θ for Mgen steps by directly injecting the IKL gradient into θ:
+    Update G_θ for Mgen steps by directly injecting the IKL gradient into θ,
+    optionally combined with a regression loss:
 
     ∇_θ L_IKL = E[ (a(s_φ(x_t,t,c) - s(x_t,t,c)) + (1-g)(s(x_t,t,c) - s(x_t,t,∅)))
                      · (1-t) · ∂G_θ/∂θ ]
+    L_reg     = E_{z,c} || G_θ(z,c) - clean_model(z, 1, c) ||^2
+
     where:
         x_0 = G_θ(z, c),  ε ~ N(0,I),  x_t = (1-t)*x_0 + t*ε,  t ~ U[0.01, 0.99].
 
-    This is NOT a loss — it is the gradient itself.  We compute
+    The IKL part is NOT a loss — it is the gradient itself.  We compute
         coeff = (a(s_φ - s) + (1-g)(s - s_∅)) · (1-t)       (shape (B, N), detached)
     then call  x_0.backward(gradient=coeff / B)  so that the accumulated param
-    gradient equals  (1/B) Σ_i coeff_i · ∂G_θ(z_i,c_i)/∂θ,
-    and opt.step() performs  θ ← θ − η · ∇_θ L_IKL.
+    gradient equals  (1/B) Σ_i coeff_i · ∂G_θ(z_i,c_i)/∂θ.
+    If reg_weight > 0, L_reg is added on top via a second backward pass.
 
     Args:
         G_theta: OneStepGenerator (trainable).
@@ -173,7 +178,9 @@ def train_generator_ikl(
         C, N: classes, dim.
         a, g: alignment and guidance (e.g. a=1, g=1).
         lr, device, verbose: training options.
-        reweight: whether to use time-reweighting. If False, use exact derivation; if True, use * t**2/(1-t) as reweight (based on original DMD)
+        clean_model: CleanPredModel (required if reweight=True or reg_weight>0).
+        reweight: whether to reweight the IKL loss L_IKL by t^2 / ((1-t)|clean_pred - x0|).
+        reg_weight: weight λ for the regression loss L_reg. 0 = disabled.
 
     Returns:
         List of gradient-norm values (for logging).
@@ -182,6 +189,8 @@ def train_generator_ikl(
     G_theta = G_theta.to(device).train()
     score_model_phi.eval()
     score_model_teacher.eval()
+    if clean_model is not None:
+        clean_model.eval()
     empty_label = score_model_teacher.velocity_model.num_classes
     opt = torch.optim.Adam(G_theta.parameters(), lr=lr)
     grad_norms = []
@@ -190,39 +199,171 @@ def train_generator_ikl(
         z = torch.randn(batch_size, N, device=device)
         eps = torch.randn(batch_size, N, device=device)
         c = torch.randint(0, C, (batch_size,), device=device, dtype=torch.long)
-        t = torch.rand(batch_size, device=device) * 0.96 + 0.02  # U[0.02, 0.98]
+        t = torch.rand(batch_size, device=device) * 0.98 + 0.01 # U[0.01, 0.99]
         t_col = t.unsqueeze(-1)  # (B, 1)
 
         # 1. Forward G_theta once (keep graph for backward later)
-        x_0 = G_theta(z, c) 
-        
-        # 2. Compute coeff using detached x_0
+        x_0 = G_theta(z, c)
+
+        # 2. Compute coeff using detached x_0 and score models
         with torch.no_grad():
-            x_0_detached = x_0.detach()  
+            x_0_detached = x_0.detach()
             x_t = (1 - t_col) * x_0_detached + t_col * eps
-            
             s_phi = score_model_phi(x_t, t, c)
             s = score_model_teacher(x_t, t, c)
             c_empty = torch.full((batch_size,), empty_label, dtype=torch.long, device=device)
             s_empty = score_model_teacher(x_t, t, c_empty)
+            coeff = (a * (s_phi - s) + (1 - g) * (s - s_empty)) * (1 - t_col)  # (B, N)
             if reweight:
-                coeff = (a * (s_phi - s) + (1 - g) * (s - s_empty)) * t_col**2 
-            else:
-                coeff = (a * (s_phi - s) + (1 - g) * (s - s_empty)) * (1 - t_col)
+                # Based on original DMD paper Equation (8), ignoring the CS constant.
+                assert clean_model is not None, "Clean_model is required for reweighting!"
+                x_0_pred = clean_model(x_t, t_col, c)
+                d = torch.norm(x_0_pred - x_0_detached, p=1, dim=1, keepdim=True)
+                eps_stable = 1e-6
+                w = t_col**2 / ((1 - t_col) * (d + eps_stable))
+                coeff = coeff * w
 
-        # 3. Backward directly
+        # 3. Backward: inject IKL gradient (+ optional regression loss)
         opt.zero_grad()
-        x_0.backward(gradient=coeff / batch_size) 
-        torch.nn.utils.clip_grad_norm_(G_theta.parameters(), max_norm=1.0) # Gradient clip
-        opt.step()
+        need_reg = reg_weight > 0
+        x_0.backward(gradient=coeff / batch_size, retain_graph=need_reg)
 
+        if need_reg:
+            assert clean_model is not None, "clean_model is required for reg_weight > 0!"
+            with torch.no_grad():
+                t_one = torch.ones(batch_size, 1, device=device)
+                y = clean_model(z, t_one, c)           # teacher one-step prediction from noise
+            L_reg = ((x_0 - y) ** 2).mean()
+            (reg_weight * L_reg).backward()
+
+        opt.step()
 
         # Log gradient norm for monitoring
         gn = sum(p.grad.norm().item() ** 2 for p in G_theta.parameters() if p.grad is not None) ** 0.5
         grad_norms.append(gn)
         if verbose and (step + 1) % 50 == 0:
             print(f"  [G IKL] step {step + 1}/{Mgen}  grad_norm {gn:.6f}")
+
+    # Restore v_phi to train mode (score_model_phi.eval() silently set it to eval
+    # because v_phi is a registered submodule of ScoreModel)
+    score_model_phi.velocity_model.train()
     return grad_norms
+
+
+def train_generator_aikl(
+    G_theta,
+    v_phi,
+    v_teacher,
+    Mgen,
+    batch_size,
+    C,
+    N,
+    reweight = False,
+    clean_model = None,
+    reg_weight=0.0,
+    lr=1e-4,
+    device=None,
+    verbose=True,
+):
+    """
+    Update G_θ for Mgen steps using the Adjusted-IKL loss,
+    optionally combined with a regression loss:
+
+    L_AIKL = E_{z, ε, c, t} [ w_t · ||v_φ(x_t, t, c) - v(x_t, t, c)||^2 ]
+    L_reg  = E_{z, c} || G_θ(z, c) - clean_model(z, 1, c) ||^2
+
+    where x_0 = G_θ(z, c),  ε ~ N(0,I),  x_t = (1-t)*x_0 + t*ε,  t ~ U[0.01, 0.99].
+
+    This IS a loss (not just a gradient).  Gradient flows through x_t → x_0 → G_θ.
+    v_φ and v (teacher) are frozen but evaluated with grad enabled so that
+    the chain rule propagates through x_t.
+
+    Args:
+        G_theta: OneStepGenerator (trainable).
+        v_phi: VelocityMLP — student velocity (frozen, no param update).
+        v_teacher: VelocityMLP — teacher velocity (pretrained, frozen).
+        Mgen: number of generator steps.
+        batch_size: K per step.
+        C, N: classes, dim.
+        lr, device, verbose: training options.
+        clean_model: CleanPredModel (required if reweight=True or reg_weight>0).
+        reweight: whether to reweight by t^2 / ((1-t)|clean_pred - x0|).
+        reg_weight: weight λ for the regression loss L_reg. 0 = disabled.
+
+    Returns:
+        List of loss values (for logging).
+    """
+    device = device or next(G_theta.parameters()).device
+    G_theta = G_theta.to(device).train()
+
+    # Freeze v_phi and v_teacher parameters (but keep forward differentiable through x_t)
+    v_phi.eval()
+    v_teacher.eval()
+    if clean_model is not None:
+        clean_model.eval()
+    for p in v_phi.parameters():
+        p.requires_grad_(False)
+    for p in v_teacher.parameters():
+        p.requires_grad_(False)
+
+    opt = torch.optim.Adam(G_theta.parameters(), lr=lr)
+    losses = []
+
+    for step in range(Mgen):
+        z = torch.randn(batch_size, N, device=device)
+        eps = torch.randn(batch_size, N, device=device)
+        c = torch.randint(0, C, (batch_size,), device=device, dtype=torch.long)
+        t = torch.rand(batch_size, device=device) * 0.98 + 0.01  # U[0.01, 0.99]
+        t_col = t.unsqueeze(-1)  # (B, 1)
+
+        # x_0 = G_θ(z, c)  — with grad
+        x_0 = G_theta(z, c)
+        # x_t = (1-t)*x_0 + t*ε  — grad flows through x_0
+        x_t = (1 - t_col) * x_0 + t_col * eps
+
+        # Evaluate velocities at x_t (differentiable through x_t)
+        vf = v_phi(x_t, t, c)       # student velocity
+        vr = v_teacher(x_t, t, c)   # teacher velocity
+
+        # Per-sample squared error: (B, N)
+        diff_sq = (vf - vr) ** 2
+
+        if reweight:
+            # Same reweighting as in train_generator_ikl (DMD paper Eqn 8)
+            assert clean_model is not None, "clean_model is required for reweighting!"
+            with torch.no_grad():
+                x_0_pred = clean_model(x_t.detach(), t_col, c)
+                d = torch.norm(x_0_pred - x_0.detach(), p=1, dim=1, keepdim=True)
+                eps_stable = 1e-6
+                w = t_col ** 2 / ((1 - t_col) * (d + eps_stable))
+            loss = (w * diff_sq).mean()
+        else:
+            loss = diff_sq.mean()
+
+        # Optional regression loss: L_reg = ||G_θ(z,c) - clean_model(z,1,c)||^2
+        if reg_weight > 0:
+            assert clean_model is not None, "clean_model is required for reg_weight > 0!"
+            with torch.no_grad():
+                t_one = torch.ones(batch_size, 1, device=device)
+                y = clean_model(z, t_one, c)
+            L_reg = ((x_0 - y) ** 2).mean()
+            loss = loss + reg_weight * L_reg
+
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(G_theta.parameters(), max_norm=1.0)
+        opt.step()
+
+        losses.append(loss.item())
+        if verbose and (step + 1) % 50 == 0:
+            print(f"  [G AIKL] step {step + 1}/{Mgen}  loss {loss.item():.6f}")
+
+    # Restore v_phi: requires_grad and train mode (v_teacher stays frozen permanently)
+    for p in v_phi.parameters():
+        p.requires_grad_(True)
+    v_phi.train()
+
+    return losses
 
 
 def dmd_distillation(
@@ -270,7 +411,7 @@ def dmd_distillation(
         device, verbose: options.
 
     Returns:
-        G_theta, v_phi (trained in place), and dict of loss lists for logging.
+        G_theta, v_phi (trained in place), and dict of loss/grad-norm lists for logging.
     """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     G_theta = G_theta.to(device)
@@ -282,7 +423,7 @@ def dmd_distillation(
 
     if verbose:
         print("Phase 0: Train G_θ regression to clean_prediction(z, 1, c)")
-    history["reg"] = train_generator_regression(
+    history["reg"] = initialize_generator_regression(
         G_theta, clean_model, num_steps=reg_steps, batch_size=batch_size,
         C=C, N=N, lr=lr_G, device=device, verbose=verbose,
     )
@@ -301,11 +442,11 @@ def dmd_distillation(
         score_model_phi = ScoreModel(v_phi)
         if verbose:
             print(f"Phase 2: Train G_θ for {Mgen} steps (IKL)")
-        ikl_losses = train_generator_ikl(
+        ikl_gnorms = train_generator_ikl(
             G_theta, score_model_phi, score_model_teacher,
             Mgen=Mgen, batch_size=batch_size, C=C, N=N, a=a, g=g,
             lr=lr_G, device=device, verbose=verbose,
         )
-        history["ikl"].extend(ikl_losses)
+        history["ikl"].extend(ikl_gnorms)
 
     return G_theta, v_phi, history

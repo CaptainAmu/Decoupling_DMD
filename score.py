@@ -55,7 +55,7 @@ class ScoreModel(nn.Module):
                           + g * ( (t-1)/t * (v(x_t,t,c) - v(x_t,t,∅)) )
     """
 
-    def __init__(self, velocity_model, guidance = 1.0, empty_label=None):
+    def __init__(self, velocity_model, guidance = 1.0, empty_label=None): # empty_label is the unconditional label, in training used C by default.
         super().__init__()
         self.velocity_model = velocity_model
         self.empty_label = empty_label
@@ -65,7 +65,7 @@ class ScoreModel(nn.Module):
         v_model = self.velocity_model
         empty_label = self.empty_label
         if empty_label is None:
-            empty_label = v_model.num_classes
+            empty_label = v_model.num_classes # Unconditional label
         B = x_t.shape[0]
         device = x_t.device
         if not isinstance(t, torch.Tensor):
@@ -74,9 +74,9 @@ class ScoreModel(nn.Module):
             t = t.unsqueeze(-1)
         t_safe = t.clamp(min=1e-5)
         if c is None:
-            c = torch.randint(0, v_model.num_classes, (B,), device=device, dtype=torch.long)
+            c = torch.randint(0, v_model.num_classes, (B,), device=device, dtype=torch.long)  # Set random target labels for all samples
         elif isinstance(c, int):
-            c = torch.full((B,), c, dtype=torch.long, device=device)
+            c = torch.full((B,), c, dtype=torch.long, device=device) # Set target label as c for all samples
 
         # unconditional velocity (empty label)
         c_empty = torch.full((B,), empty_label, dtype=torch.long, device=device)
