@@ -135,7 +135,7 @@ def train_velocity_from_generator(
     return losses
 
 
-def train_generator_ikl(
+def distill_via_score_DMD(
     G_theta,
     score_model_phi,
     score_model_teacher,
@@ -250,7 +250,7 @@ def train_generator_ikl(
     return grad_norms
 
 
-def train_generator_aikl(
+def distill_via_score_SiD(
     G_theta,
     v_phi,
     v_teacher,
@@ -366,6 +366,197 @@ def train_generator_aikl(
     return losses
 
 
+# ---------------------------------------------------------------------------
+#  Clean-prediction based distillation (Phase 1 + Phase 2)
+# ---------------------------------------------------------------------------
+
+def train_clean_from_generator(
+    clean_phi,
+    G_theta,
+    Mvel,
+    batch_size,
+    C,
+    N,
+    drop_label_prob=0.0,
+    lr=1e-4,
+    device=None,
+    verbose=True,
+):
+    """
+    Train student clean-prediction model x_φ(x_t, t, c) for Mvel steps
+    using fresh samples from G_θ.
+
+    Each step:
+        z ~ N(0, I_N), c ~ p(C),  x0 = G_θ(z, c)  [no grad through G_θ]
+        ε ~ N(0, I_N)  (independent)
+        x_t = (1-t) x0 + t ε,  target = x0
+        loss = ||x_φ(x_t, t, c) - x0||^2
+
+    This is the clean-prediction analogue of train_velocity_from_generator
+    (which trains velocity with target ε − x0).
+
+    Args:
+        clean_phi: CleanMLP (student) with forward(x_t, t, c) -> x0_pred.
+        G_theta: OneStepGenerator; kept frozen (eval mode, no grad).
+        Mvel: number of training steps.
+        batch_size: K per step.
+        C, N: number of classes, ambient dim.
+        drop_label_prob: p for dropping c to empty label.
+        lr, device, verbose: training options.
+
+    Returns:
+        List of losses.
+    """
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    G_theta.eval()
+    clean_phi = clean_phi.to(device).train()
+    opt = torch.optim.Adam(clean_phi.parameters(), lr=lr)
+    num_classes = clean_phi.num_classes
+    losses = []
+
+    for step in range(Mvel):
+        z = torch.randn(batch_size, N, device=device)
+        c = torch.randint(0, C, (batch_size,), device=device, dtype=torch.long)
+        with torch.no_grad():
+            x0 = G_theta(z, c)
+        eps = torch.randn(batch_size, N, device=device)
+
+        # Drop label with prob p -> set c = empty (num_classes)
+        if drop_label_prob > 0:
+            mask = torch.rand(batch_size, device=device) < drop_label_prob
+            c = c.clone()
+            c[mask] = num_classes
+
+        t = torch.rand(batch_size, device=device)
+        x_t = (1 - t).unsqueeze(-1) * x0 + t.unsqueeze(-1) * eps
+
+        xp = clean_phi(x_t, t, c)
+        loss = nn.functional.mse_loss(xp, x0)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+
+        if verbose and (step + 1) % 100 == 0:
+            print(f"    [x_phi] step {step + 1}/{Mvel} loss {loss.item():.6f}")
+
+    return losses
+
+
+def distill_via_clean_DMD(
+    G_theta,
+    clean_phi,
+    clean_teacher,
+    Mgen,
+    batch_size,
+    C,
+    N,
+    a=1.0,
+    g=1.0,
+    lr=1e-4,
+    reweight=False,
+    reg_weight=0.0,
+    device=None,
+    verbose=True,
+):
+    """
+    Update G_θ for Mgen steps by directly injecting the clean-prediction
+    IKL gradient into θ, optionally combined with a regression loss.
+
+    The gradient (derived by substituting s = ((1-t)x* - x_t) / t^2 into
+    the score-based DMD gradient) is:
+
+    ∇_θ L = E[ w'_t · (a(x_φ - x_teacher) + (1-g)(x_teacher - x_∅))
+                · ∂G_θ/∂θ ]
+
+    where:
+        x_0 = G_θ(z, c),  ε ~ N(0,I),  x_t = (1-t)*x_0 + t*ε.
+
+    Base weight (no reweight): w'_t = (1-t)^2 / t^2.
+    With reweight (DMD paper Eqn 8):
+        w'_t = (1-t) / (||x_teacher(x_t,t,c) - x_0||_1 + ε_stable).
+
+    L_reg = E_{z,c} || G_θ(z,c) - clean_teacher(z, 1, c) ||^2.
+
+    Args:
+        G_theta: OneStepGenerator (trainable).
+        clean_phi: student clean-prediction model (e.g. CleanMLP).
+        clean_teacher: teacher clean-prediction model (e.g. CleanMLP).
+        Mgen: number of generator steps.
+        batch_size: K per step.
+        C, N: classes, dim.
+        a, g: alignment and guidance.
+        lr, device, verbose: training options.
+        reweight: whether to use simplified DMD reweight.
+        reg_weight: weight λ for regression loss. 0 = disabled.
+
+    Returns:
+        List of gradient-norm values (for logging).
+    """
+    device = device or next(G_theta.parameters()).device
+    G_theta = G_theta.to(device).train()
+    clean_phi.eval()
+    clean_teacher.eval()
+    empty_label = clean_teacher.num_classes
+    opt = torch.optim.Adam(G_theta.parameters(), lr=lr)
+    grad_norms = []
+
+    for step in range(Mgen):
+        z = torch.randn(batch_size, N, device=device)
+        eps = torch.randn(batch_size, N, device=device)
+        c = torch.randint(0, C, (batch_size,), device=device, dtype=torch.long)
+        t = torch.rand(batch_size, device=device) * 0.98 + 0.01  # U[0.01, 0.99]
+        t_col = t.unsqueeze(-1)  # (B, 1)
+
+        # 1. Forward G_theta once (keep graph for backward later)
+        x_0 = G_theta(z, c)
+
+        # 2. Compute coeff using detached x_0 and clean-prediction models
+        with torch.no_grad():
+            x_0_det = x_0.detach()
+            x_t = (1 - t_col) * x_0_det + t_col * eps
+
+            xp = clean_phi(x_t, t, c)           # student
+            xt = clean_teacher(x_t, t, c)        # teacher conditional
+            c_empty = torch.full((batch_size,), empty_label, dtype=torch.long, device=device)
+            xe = clean_teacher(x_t, t, c_empty)  # teacher unconditional
+
+            delta = a * (xp - xt) + (1 - g) * (xt - xe)
+
+            if reweight:
+                # Simplified weight: w'_t = (1-t) / ||x_teacher - x_0||_1
+                d = torch.norm(xt - x_0_det, p=1, dim=1, keepdim=True)
+                eps_stable = 1e-6
+                coeff = (1 - t_col) / (d + eps_stable) * delta
+            else:
+                # Base weight: w'_t = (1-t)^2 / t^2
+                coeff = (1 - t_col) ** 2 / (t_col ** 2) * delta
+
+        # 3. Backward: inject gradient (+ optional regression loss)
+        opt.zero_grad()
+        need_reg = reg_weight > 0
+        x_0.backward(gradient=coeff / batch_size, retain_graph=need_reg)
+
+        if need_reg:
+            with torch.no_grad():
+                t_one = torch.ones(batch_size, 1, device=device)
+                y = clean_teacher(z, t_one, c)
+            L_reg = ((x_0 - y) ** 2).mean()
+            (reg_weight * L_reg).backward()
+
+        opt.step()
+
+        # Log gradient norm for monitoring
+        gn = sum(p.grad.norm().item() ** 2 for p in G_theta.parameters() if p.grad is not None) ** 0.5
+        grad_norms.append(gn)
+        if verbose and (step + 1) % 50 == 0:
+            print(f"  [G clean-DMD] step {step + 1}/{Mgen}  grad_norm {gn:.6f}")
+
+    # Restore clean_phi to train mode
+    clean_phi.train()
+    return grad_norms
+
+
 def dmd_distillation(
     G_theta,
     v_phi,
@@ -442,7 +633,7 @@ def dmd_distillation(
         score_model_phi = ScoreModel(v_phi)
         if verbose:
             print(f"Phase 2: Train G_θ for {Mgen} steps (IKL)")
-        ikl_gnorms = train_generator_ikl(
+        ikl_gnorms = distill_via_score_DMD(
             G_theta, score_model_phi, score_model_teacher,
             Mgen=Mgen, batch_size=batch_size, C=C, N=N, a=a, g=g,
             lr=lr_G, device=device, verbose=verbose,

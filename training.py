@@ -15,7 +15,8 @@ def train_flow_matching(
     data_source,
     num_steps,
     batch_size,
-    drop_label_prob=0.0,
+    type = "velocity",
+    drop_label_prob=0.1,
     lr=1e-4,
     device=None,
     verbose=True,
@@ -59,10 +60,14 @@ def train_flow_matching(
 
         t = torch.rand(batch_size, device=device)
         x_t = (1 - t).unsqueeze(-1) * x0 + t.unsqueeze(-1) * eps
-        target = eps - x0
+        assert type in ["velocity", "clean"], "Invalid type: {type}, must be 'velocity' or 'clean'"
+        if type == "velocity":
+            target = eps - x0
+        elif type == "clean":
+            target = x0
 
-        v = model(x_t, t, c)
-        loss = nn.functional.mse_loss(v, target)
+        pred = model(x_t, t, c)
+        loss = nn.functional.mse_loss(pred, target)
         opt.zero_grad()
         loss.backward()
         opt.step()
