@@ -9,7 +9,7 @@ import torch
 import math
 
 
-def simple_sample(C, N, dims=None):
+def simple_Gaussian_sample(C, N, dims=None):
     """
     Create a distribution of C classes (c = 0, ..., C-1) of disparate amorphous blobs in R^N,
     Class c lives on a dims[c]-dimensional Gaussian subspace.
@@ -115,6 +115,131 @@ def simple_sample(C, N, dims=None):
             return x, c
 
     return _SimpleSampler()
+
+
+
+
+
+
+
+def simple_Sphere_sample(C, N, dims=None, noise_std=0.0):
+    """
+    Create a distribution of C classes of spheres in R^N.
+    Class c is a dims[c]-dimensional sphere S^{d_c} (uniformly sampled),
+    embedded in R^N via a random orthonormal frame, with random center and radius.
+
+    A d-dimensional sphere S^d needs (d+1) ambient coordinates, so we require
+    dims[c] <= N-1  (i.e. d+1 <= N).
+
+    Concretely, for class c with d_c = dims[c]:
+        1. Sample u ~ N(0, I_{d_c+1}), normalise to  û = u / ||u||  (uniform on S^{d_c}).
+        2. Scale: û *= r_c  (random radius, fixed per class).
+        3. Embed: x = μ_c + B_c @ û,  where B_c is (N, d_c+1) orthonormal.
+        4. (Optional) Perturb: x += noise_std * N(0, I_N) to give the sphere thickness.
+
+    Args:
+        C: number of classes (labels 0, ..., C-1).
+        N: ambient dimension (space is R^N).
+        dims: list of length C; sphere dimension d_c for each class.
+              Must satisfy 1 <= d_c <= N-1.  Default [N-1, N-1, ..., N-1].
+        noise_std: standard deviation of ambient Gaussian noise added to each
+                   sample after projection onto the sphere. Default 0.0 (no noise).
+                   A small positive value (e.g. 0.05-0.1) gives the manifold
+                   "thickness", which helps flow-matching learn singular distributions.
+
+    Returns:
+        A callable with the same interface as simple_Gaussian_sample:
+        sampler(K, device=, class_idx=) -> (x, c).
+    """
+    if dims is None:
+        dims = [N - 1] * C
+    if len(dims) != C:
+        raise ValueError(f"dims must have length C={C}, got {len(dims)}")
+    if any(d <= 0 or d > N - 1 for d in dims):
+        raise ValueError(
+            f"each d_c in dims must satisfy 1 <= d_c <= N-1={N-1} "
+            f"(S^d needs d+1 <= N), got {dims}"
+        )
+
+    # Per-class random center in R^N, pushed far apart
+    center_radius = 5.0 * math.sqrt(N)
+    raw_centers = torch.randn(C, N)
+    norms = raw_centers.norm(dim=1, keepdim=True).clamp_min(1e-6)
+    centers = center_radius * raw_centers / norms
+
+    # Per-class random sphere radius (uniform in [0.5, 2.0])
+    radii = torch.rand(C) * 1.5 + 0.5  # (C,)
+
+    # Per-class orthonormal basis B_c of shape (N, d_c+1)
+    # The (d_c+1) columns span the subspace that hosts S^{d_c}
+    bases = []
+    for d in dims:
+        A = torch.randn(N, d + 1)
+        Q, _ = torch.linalg.qr(A, mode="reduced")
+        bases.append(Q[:, : d + 1])  # (N, d+1)
+
+    class _SphereSampler:
+        def __call__(self, K, device=None, class_idx=None):
+            """
+            Sample K points.
+
+            Args:
+                K: number of points.
+                device: torch device.
+                class_idx:
+                    - None or int == C: each point gets a random class.
+                    - int in {0, ..., C-1}: all K points from this class.
+                    - 1D tensor / list of length K: per-point class indices.
+            """
+            dev = device or centers.device
+
+            # --- resolve class labels (identical logic to Gaussian sampler) ---
+            if class_idx is None or (isinstance(class_idx, int) and class_idx == C):
+                c = torch.randint(0, C, (K,), dtype=torch.long, device=dev)
+            else:
+                if isinstance(class_idx, int):
+                    if not (0 <= class_idx < C):
+                        raise ValueError(
+                            f"class_idx must be in [0, {C-1}] or equal to C for random, got {class_idx}"
+                        )
+                    c = torch.full((K,), class_idx, dtype=torch.long, device=dev)
+                else:
+                    c = torch.as_tensor(class_idx, dtype=torch.long, device=dev)
+                    if c.numel() == 1:
+                        c = c.expand(K)
+                    if c.shape[0] != K:
+                        raise ValueError(f"class_idx must have length {K}, got {c.shape[0]}")
+                    if not torch.all((0 <= c) & (c < C)):
+                        raise ValueError(f"class indices must be in [0, {C-1}]")
+
+            # --- allocate output ---
+            x = torch.empty(K, N, dtype=centers.dtype, device=dev)
+
+            centers_dev = centers.to(dev)
+            radii_dev = radii.to(dev)
+            bases_dev = [B.to(dev) for B in bases]
+
+            for cls in range(C):
+                mask = (c == cls)
+                n_k = int(mask.sum().item())
+                if n_k == 0:
+                    continue
+                d_c = dims[cls]
+                # Sample uniform on S^{d_c}: Gaussian in R^{d_c+1}, then normalise
+                u = torch.randn(n_k, d_c + 1, dtype=centers.dtype, device=dev)
+                u = u / u.norm(dim=1, keepdim=True).clamp_min(1e-8)
+                u = u * radii_dev[cls]         # scale by sphere radius
+                B_c = bases_dev[cls]           # (N, d_c+1)
+                # Embed: x_k = center_c + u @ B_c^T
+                x_k = u @ B_c.T + centers_dev[cls].unsqueeze(0)  # (n_k, N)
+                # Optionally perturb with ambient Gaussian noise for manifold thickness
+                if noise_std > 0:
+                    x_k = x_k + noise_std * torch.randn_like(x_k)
+                x[mask] = x_k
+
+            return x, c
+
+    return _SphereSampler()
 
 
 def pair_sample(f, N):

@@ -6,7 +6,7 @@ the trained velocity field v_θ, with T steps and step size 1/T.
 """
 
 
-def ode_backward(model, T, K, c, type = "velocity", device=None, guidance: float = 1.0, steps=None):
+def ode_backward(model, T, K, c, type = "velocity", device=None, guidance: float = 1.0, steps=None, return_labels=False):
     """
     Run ODE backward from t=1 (noise) to t≈0 (data) in `steps` steps, step size 1/steps.
 
@@ -16,15 +16,18 @@ def ode_backward(model, T, K, c, type = "velocity", device=None, guidance: float
         model: trained velocity / clean predictionmodel with forward(x_t, t, c) -> ...
         T: default number of steps when steps is None.
         K: number of samples (batch size).
-        c: int in {0, ..., C-1, C} or None. 0..C-1 = condition on that class; C or None = use
-           label C (same as dropped label in training), i.e. unconditional / class-agnostic.
+        c: int in {0, ..., C-1, C}, None, or a (K,) LongTensor of per-sample labels.
+           0..C-1 = condition on that class; C or None = use random labels (uniform).
+           When a Tensor is provided it is used directly as per-sample labels.
         type: "velocity" or "clean", default is "velocity" (for the model supplied)
         steps: number of steps; dt = 1/steps. If None, use T.
         device: torch device; if None, use model's device.
         guidance: guidance scale g. When g != 1, use v_guided = v(∅) + g*(v(c)-v(∅)).
+        return_labels: if True, return (x, cond_labels) instead of just x.
 
     Returns:
         x: (K, N) approximate samples at t≈0.
+        cond_labels (optional): (K,) LongTensor of class labels used, if return_labels=True.
     """
     steps = steps if steps is not None else T
     dt = 1.0 / T
@@ -33,12 +36,14 @@ def ode_backward(model, T, K, c, type = "velocity", device=None, guidance: float
     N = model.dim
     C = model.num_classes
 
-    if c is None:
+    if isinstance(c, torch.Tensor):
+        cond_labels = c.to(device)
+    elif c is None:
         cond_labels = torch.randint(0, C, (K,), device=device, dtype=torch.long)
     elif isinstance(c, int) and 0 <= c <= C:
         cond_labels = torch.full((K,), c, dtype=torch.long, device=device)
     else:
-        raise ValueError(f"c class must be an int in {0,..., C} (C for unconditional), or None (uniform over all classes), got {c}")
+        raise ValueError(f"c class must be an int in {0,..., C} (C for unconditional), None (uniform over all classes), or a (K,) LongTensor, got {c}")
 
     with torch.no_grad():
         x = torch.randn(K, N, device=device)
@@ -62,6 +67,8 @@ def ode_backward(model, T, K, c, type = "velocity", device=None, guidance: float
                 x = x - v_eff * dt
                 t = t - dt
 
+    if return_labels:
+        return x, cond_labels
     return x
 
 
