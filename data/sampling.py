@@ -162,7 +162,7 @@ def simple_Sphere_sample(C, N, dims=None, noise_std=0.0):
         )
 
     # Per-class random center in R^N, pushed far apart
-    center_radius = 5.0 * math.sqrt(N)
+    center_radius = 2.0 * math.sqrt(N)
     raw_centers = torch.randn(C, N)
     norms = raw_centers.norm(dim=1, keepdim=True).clamp_min(1e-6)
     centers = center_radius * raw_centers / norms
